@@ -128,51 +128,7 @@ void worker_compute_block(int rank,
     }
 }
 
-// Compute this rank's row block of C using a single B shard
-void worker_compute_block(int rank,
-                          std::size_t M,
-                          std::size_t N,
-                          std::size_t K,
-                          std::size_t row_start_global,
-                          std::size_t row_end_global,
-                          const float* A_local,
-                          float* C_global,
-                          float* B_block,   // renamed from B_shard
-                          std::size_t col_start,
-                          std::size_t col_end)
-{
-    std::size_t local_rows = (row_end_global > row_start_global)
-                             ? (row_end_global - row_start_global)
-                             : 0;
-    std::size_t local_cols = (col_end > col_start) ? (col_end - col_start) : 0;
 
-    if (local_rows == 0 || local_cols == 0) {
-        std::cout << "Rank " << rank << ": no work (local_rows=" << local_rows
-                  << ", local_cols=" << local_cols << ")\n";
-        return;
-    }
-
-    std::cout << "Rank " << rank << ": computing rows [" << row_start_global
-              << ", " << row_end_global << ") for columns [" << col_start
-              << ", " << col_end << ")\n";
-
-    for (std::size_t i_local = 0; i_local < local_rows; ++i_local) {
-        std::size_t i_global = row_start_global + i_local;
-
-        for (std::size_t j_local = 0; j_local < local_cols; ++j_local) {
-            std::size_t j_global = col_start + j_local;
-            float acc = 0.0f;
-
-            for (std::size_t k = 0; k < K; ++k) {
-                float a_ik = A_local[i_local * K + k];
-                float b_kj = B_block[j_local * K + k]; // column-major slice
-                acc += a_ik * b_kj;
-            }
-
-            C_global[i_global * N + j_global] = acc;
-        }
-    }
-}
 
 // Worker process: bind to NUMA node, load local A, compute C using B in shared memory
 void worker_process(int rank,
