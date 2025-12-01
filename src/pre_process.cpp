@@ -1,10 +1,17 @@
 // convert_dense_mtx_to_bin.cpp
 //
 // Usage:
-//   ./mtx2bin input.mtx output.bin metadata.txt
+//   ./mtx2bin input.mtx output.bin metadata.txt [row|col]
 //
-// output.bin:  row-major float32 data, M * N elements
-// metadata.txt: single line "M N\n"
+//   input.mtx    : dense Matrix Market (array) file
+//   output.bin   : float32 data, either row-major or column-major
+//   metadata.txt : single line "M N\n"
+//   layout       : optional, "row" (default) or "col"
+//
+// If layout is omitted, row-major is used.
+//
+// Row-major layout:  element (i,j) at index i * N + j
+// Column-major layout: element (i,j) at index j * M + i
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,7 +23,6 @@
 #include <iostream>
 
 #include "../include/mmio.h"   // make sure mmio.h / mmio.c are in your include path
-
 
 struct MatrixDims {
     int M;
@@ -109,6 +115,32 @@ static void write_row_major_f32_bin(const std::string &bin_filename,
     }
 }
 
+// NEW: write column-major float32 directly
+static void write_col_major_f32_bin(const std::string &bin_filename,
+                                    const std::vector<double> &col_major,
+                                    const MatrixDims &dims) {
+    const int M = dims.M;
+    const int N = dims.N;
+    const std::size_t total = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
+
+    std::vector<float> col_major_f32(total);
+    for (std::size_t k = 0; k < total; ++k) {
+        col_major_f32[k] = static_cast<float>(col_major[k]);
+    }
+
+    std::ofstream ofs(bin_filename, std::ios::binary);
+    if (!ofs) {
+        throw std::runtime_error("Cannot open output bin file: " + bin_filename);
+    }
+
+    ofs.write(reinterpret_cast<const char *>(col_major_f32.data()),
+              static_cast<std::streamsize>(total * sizeof(float)));
+
+    if (!ofs) {
+        throw std::runtime_error("Error while writing bin file: " + bin_filename);
+    }
+}
+
 // Write metadata file: single line "M N\n"
 static void write_metadata(const std::string &meta_filename, const MatrixDims &dims) {
     std::ofstream meta(meta_filename);
@@ -122,12 +154,13 @@ static void write_metadata(const std::string &meta_filename, const MatrixDims &d
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
+    if (argc != 4 && argc != 5) {
         std::fprintf(stderr,
-                     "Usage: %s input.mtx output.bin metadata.txt\n"
+                     "Usage: %s input.mtx output.bin metadata.txt [row|col]\n"
                      "  input.mtx    : dense Matrix Market (array) file\n"
-                     "  output.bin   : row-major float32 data (M*N elements)\n"
-                     "  metadata.txt : text file with 'M N' on one line\n",
+                     "  output.bin   : float32 data (M*N elements)\n"
+                     "  metadata.txt : text file with 'M N' on one line\n"
+                     "  layout       : optional, 'row' (default) or 'col'\n",
                      argv[0]);
         return EXIT_FAILURE;
     }
@@ -136,10 +169,24 @@ int main(int argc, char **argv) {
     const std::string output_bin = argv[2];
     const std::string meta_file  = argv[3];
 
+    std::string layout = "row";
+    if (argc == 5) {
+        layout = argv[4];
+    }
+
     try {
         MatrixDims dims;
         auto col_major = read_mtx_dense_col_major(input_mtx, dims);
-        write_row_major_f32_bin(output_bin, col_major, dims);
+
+        if (layout == "row") {
+            write_row_major_f32_bin(output_bin, col_major, dims);
+        } else if (layout == "col") {
+            write_col_major_f32_bin(output_bin, col_major, dims);
+        } else {
+            throw std::runtime_error("Unknown layout '" + layout +
+                                     "'. Expected 'row' or 'col'.");
+        }
+
         write_metadata(meta_file, dims);
     } catch (const std::exception &ex) {
         std::fprintf(stderr, "Error: %s\n", ex.what());
