@@ -83,8 +83,6 @@ bool pread_all(int fd, void* dst, std::size_t bytes, std::size_t offset) {
     }
     return true;
 }
-
-// Compute this rank's row block of C using a single B shard
 void worker_compute_block(int rank,
                           std::size_t M,
                           std::size_t N,
@@ -93,7 +91,7 @@ void worker_compute_block(int rank,
                           std::size_t row_end_global,
                           const float* A_local,
                           float* C_global,
-                          float* B_shard,
+                          float* B_block,   // renamed from B_shard
                           std::size_t col_start,
                           std::size_t col_end)
 {
@@ -121,7 +119,7 @@ void worker_compute_block(int rank,
 
             for (std::size_t k = 0; k < K; ++k) {
                 float a_ik = A_local[i_local * K + k];
-                float b_kj = B_shard[j_local * K + k]; // B is column-major
+                float b_kj = B_block[j_local * K + k]; // column-major slice
                 acc += a_ik * b_kj;
             }
 
@@ -130,15 +128,61 @@ void worker_compute_block(int rank,
     }
 }
 
+// Compute this rank's row block of C using a single B shard
+void worker_compute_block(int rank,
+                          std::size_t M,
+                          std::size_t N,
+                          std::size_t K,
+                          std::size_t row_start_global,
+                          std::size_t row_end_global,
+                          const float* A_local,
+                          float* C_global,
+                          float* B_block,   // renamed from B_shard
+                          std::size_t col_start,
+                          std::size_t col_end)
+{
+    std::size_t local_rows = (row_end_global > row_start_global)
+                             ? (row_end_global - row_start_global)
+                             : 0;
+    std::size_t local_cols = (col_end > col_start) ? (col_end - col_start) : 0;
 
-// Worker process: bind to NUMA node, load local A, compute C using on-demand B shards
+    if (local_rows == 0 || local_cols == 0) {
+        std::cout << "Rank " << rank << ": no work (local_rows=" << local_rows
+                  << ", local_cols=" << local_cols << ")\n";
+        return;
+    }
+
+    std::cout << "Rank " << rank << ": computing rows [" << row_start_global
+              << ", " << row_end_global << ") for columns [" << col_start
+              << ", " << col_end << ")\n";
+
+    for (std::size_t i_local = 0; i_local < local_rows; ++i_local) {
+        std::size_t i_global = row_start_global + i_local;
+
+        for (std::size_t j_local = 0; j_local < local_cols; ++j_local) {
+            std::size_t j_global = col_start + j_local;
+            float acc = 0.0f;
+
+            for (std::size_t k = 0; k < K; ++k) {
+                float a_ik = A_local[i_local * K + k];
+                float b_kj = B_block[j_local * K + k]; // column-major slice
+                acc += a_ik * b_kj;
+            }
+
+            C_global[i_global * N + j_global] = acc;
+        }
+    }
+}
+
+// Worker process: bind to NUMA node, load local A, compute C using B in shared memory
 void worker_process(int rank,
                     int nprocs,
                     const std::string& a_path,
                     std::size_t M,
                     std::size_t K,
                     std::size_t N,
-                    float* C_global)
+                    float* C_global,
+                    float* B_global)  // <- added B_global argument
 {
     int max_node = numa_max_node();
     int num_nodes = max_node + 1;
@@ -176,7 +220,7 @@ void worker_process(int rank,
     }
     close(fdA);
 
-    // Loop over all B shards on-demand
+    // Loop over all column blocks for C using B_global
     std::size_t cols_per = (N + nprocs - 1) / nprocs;
     for (int owner = 0; owner < nprocs; ++owner) {
         std::size_t col_start = owner * cols_per;
@@ -184,27 +228,11 @@ void worker_process(int rank,
         std::size_t local_cols = (col_end > col_start) ? (col_end - col_start) : 0;
         if (local_cols == 0) continue;
 
-        std::string filename = "B_shard_" + std::to_string(owner) + ".bin";
-        int fdB = open(filename.c_str(), O_RDONLY);
-        if (fdB < 0) {
-            std::cerr << "Rank " << rank << ": cannot open B shard " << filename << "\n";
-            _exit(1);
-        }
-
-        size_t bytes = K * local_cols * sizeof(float);
-        void* map = mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fdB, 0);
-        close(fdB);
-        if (map == MAP_FAILED) {
-            std::cerr << "Rank " << rank << ": mmap failed for " << filename << "\n";
-            _exit(1);
-        }
-
-        float* B_shard = static_cast<float*>(map);
+        // Slice of B_global for these columns (column-major)
+        float* B_shard = B_global + col_start * K;
 
         // Compute partial C block
         worker_compute_block(rank, M, N, K, row_start, row_end, A_local, C_global, B_shard, col_start, col_end);
-
-        munmap(B_shard, bytes);
     }
 
     if (A_local) numa_free(A_local, local_rows * K * sizeof(float));
@@ -212,6 +240,7 @@ void worker_process(int rank,
     std::cout << "Rank " << rank << ": finished worker_process\n";
     _exit(0);
 }
+
 
 
 
@@ -245,35 +274,20 @@ int main(int argc, char** argv) {
                                                MAP_SHARED, fdC, 0));
     std::memset(C_global, 0, M*N*sizeof(float));
 
-    // --- Pre-shard B to disk ---
+    // --- Map entire B into shared memory ---
     int fdB = open(b_path.c_str(), O_RDONLY);
     if (fdB < 0) {
         std::cerr << "Failed to open B file\n";
         return 1;
     }
 
-    for (int rank = 0; rank < nprocs; ++rank) {
-        std::size_t cols_per = (N + nprocs - 1) / nprocs;
-        std::size_t col_start = rank * cols_per;
-        std::size_t col_end   = std::min(N, col_start + cols_per);
-        std::size_t local_cols = col_end - col_start;
-
-        if (local_cols == 0) continue;
-
-        float* B_local = new float[local_cols * K];
-        std::size_t offset_bytes = col_start * K * sizeof(float);
-        pread_all(fdB, B_local, local_cols*K*sizeof(float), offset_bytes);
-
-        std::string shard_filename = "B_shard_" + std::to_string(rank) + ".bin";
-        int fdShard = open(shard_filename.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
-        if (fdShard < 0) {
-            std::cerr << "Failed to create shard file: " << shard_filename << "\n";
-            delete[] B_local;
-            continue;
-        }
-        write(fdShard, B_local, local_cols*K*sizeof(float));
-        close(fdShard);
-        delete[] B_local;
+    float* B_global = static_cast<float*>(mmap(nullptr, K*N*sizeof(float),
+                                               PROT_READ,
+                                               MAP_SHARED, fdB, 0));
+    if (B_global == MAP_FAILED) {
+        std::cerr << "Failed to mmap B\n";
+        close(fdB);
+        return 1;
     }
     close(fdB);
 
@@ -282,7 +296,8 @@ int main(int argc, char** argv) {
     for (int rank = 0; rank < nprocs; ++rank) {
         pid_t pid = fork();
         if (pid == 0) {
-            worker_process(rank, nprocs, a_path, M, K, N, C_global);
+            // Pass B_global to worker_process
+            worker_process(rank, nprocs, a_path, M, K, N, C_global, B_global);
         }
         children.push_back(pid);
     }
@@ -294,6 +309,7 @@ int main(int argc, char** argv) {
     std::cout << "Parent: all workers finished\n";
 
     munmap(C_global, M*N*sizeof(float));
+    munmap(B_global, K*N*sizeof(float));
     close(fdC);
 
     return 0;
