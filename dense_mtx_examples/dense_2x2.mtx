@@ -1,0 +1,7 @@
+%%MatrixMarket matrix array real general
+% Dense 2x2 example matrix
+2 2
+1
+2
+3
+4

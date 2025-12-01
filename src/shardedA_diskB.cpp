@@ -1,8 +1,4 @@
 // compute_numa_fork.cpp
-//
-// Single-launch version with shard table:
-//   - Tracks which process owns which shard of B in shared memory
-//   - Each worker fetches all B shards to compute its full row block of C
 
 #include <iostream>
 #include <fstream>
